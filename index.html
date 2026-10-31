@@ -236,7 +236,9 @@ async function saveV(e,k,v){const iv=crypto.getRandomValues(new Uint8Array(12));
 async function ensureLocalWorkspace(email,password,role){
   const users=ls.g('rsg_users')||{};
   let user=users[email];
-  if(user&&await pb(password,user.salt)!==user.h)throw new Error('Backend sign-in succeeded, but this browser already has a local workspace with a different password.');
+  // The backend is the source of truth for passwords. If this browser holds a workspace made with an
+  // older password, it cannot be decrypted anyway, so replace it with a fresh one instead of failing.
+  if(user&&await pb(password,user.salt)!==user.h){delete users[email];user=null;try{localStorage.removeItem('rsg_v_'+email)}catch{}}
   if(!user){
     const salt=rnd(16),vs=rnd(16);
     user=users[email]={salt,h:await pb(password,salt),vs,role};
@@ -246,7 +248,7 @@ async function ensureLocalWorkspace(email,password,role){
   const key=await vk(password,user.vs),stored=ls.g('rsg_v_'+email);
   let value;
   try{value=stored?JSON.parse(dec.decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:ub(stored.iv)},key,ub(stored.d)))):newVault()}
-  catch{throw new Error('Could not decrypt the local workspace. The backend account is valid, but the local workspace password does not match.')}
+  catch{value=newVault();await saveV(email,key,value)}
   if(!stored)await saveV(email,key,value);
   return{user,key,value};
 }
