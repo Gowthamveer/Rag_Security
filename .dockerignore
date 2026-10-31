@@ -1,0 +1,12 @@
+.env
+.venv
+.git
+.gitignore
+__pycache__
+.pytest_cache
+*.py[cod]
+rsg.db
+*.sqlite
+*.sqlite3
+employees_150_sample.csv
+tests
