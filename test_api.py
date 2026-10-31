@@ -31,7 +31,7 @@ def test_dashboard_and_auth_status():
     assert "Ctrl K" not in dashboard.text
     response = client.get("/auth/status")
     assert response.status_code == 200
-    assert response.json() == {"admin_exists": False}
+    assert response.json() == {"admin_exists": False, "public_signup": True}
 
 
 def test_auth_required_for_scan():
@@ -45,7 +45,7 @@ def test_public_signup_creates_viewer_and_scopes_document_access():
     response = client.post("/auth/register", json={"email": "admin-test@example.com", "password": "Admin123"})
     assert response.status_code == 200
     assert response.json()["role"] == "admin"
-    assert client.get("/auth/status").json() == {"admin_exists": True}
+    assert client.get("/auth/status").json() == {"admin_exists": True, "public_signup": True}
     second = client.post("/auth/register", json={"email": "other-test@example.com", "password": "correct-horse-battery-10"})
     assert second.status_code == 200
     assert second.json()["role"] == "viewer"

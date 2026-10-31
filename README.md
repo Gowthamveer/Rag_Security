@@ -14,6 +14,37 @@ A defensive starter project for scanning documents and placing policy gates arou
 - Red Team includes built-in and mutated defensive tests, custom local cases, gate-by-gate outcomes, bypass filtering/reruns, false-alarm counts, and downloadable reports that omit prompts and response contents.
 - Regression tests in the root-level `test_*.py` files.
 
+## New in this version
+
+### Public sign-up switch
+Set `ALLOW_PUBLIC_SIGNUP=false` on any public deployment. The very first sign-up still creates the admin; after that only an admin can create accounts (Account tab → add user). The sign-in screen hides the Sign up button automatically.
+
+### Secure data layer (structured company data)
+`data_layer.py` is the only code that reads the `employees` table. When a question is about employees, the gateway asks `EmployeeRepository` for data on behalf of the signed-in user, and the repository selects only the columns that user's role is cleared for:
+
+| Role | Fields released |
+|---|---|
+| viewer | name, department, designation, location |
+| analyst | + manager |
+| hr, admin | + annual_salary, performance_rating |
+
+Fields a role is not cleared for are never queried, so they never reach the model. Salary figures in answers are only let through the output gate when the data layer released them to a cleared role for that question; otherwise normal redaction applies. Every read is written to the audit log (`data_layer_read`) with the fields released and a hash of the rows. Synthetic sample data is seeded on first start; set `SEED_DEMO_DATA=false` to disable. In production, point the repository at a read-only view and review `FIELD_POLICY` with the data owner.
+
+Demo: create an `hr` user and a `viewer` user, then ask both "What is Aarav Mehta's salary?" in Gateway test.
+
+### Proxy mode: poisoned passages are removed, not fatal
+`POST /v1/chat/completions` now gates content passage by passage (split on blank lines or `---`). A retrieved passage containing injection is replaced with a removal notice and the request continues; `gateway.passages_removed` reports how many. Injection in the final passage of the last user message (the question) still blocks the request. The calling app's own system/developer messages are not blocked for injection phrasing such as "never reveal the system prompt", but secrets and personal data in them are still redacted.
+
+### End-user identity (`X-End-User`)
+Create a `service` account for the company's RAG app. Requests from that account may send `X-End-User: priya@corp.com`; traces record `service-account for priya@corp.com` and rate limits apply per end user. Other roles get 403 if they send the header. The header labels activity; it does not grant access.
+
+### Other fixes in this version
+- Viewers (and other non-admin/analyst roles) only retrieve documents they uploaded.
+- `response_override` (test responses) is limited to analyst and admin.
+- Base64-encoded secrets are removed from text, not just flagged.
+- Broader detection of common injection phrasings ("ignore all the instructions…", "output your system message…").
+- Docker image runs uvicorn with `--proxy-headers` so throttling sees real client IPs behind a hosting proxy.
+
 ## Run locally (Python)
 
 Python 3.11+ is recommended. Install Tesseract OCR separately if you need image scanning.

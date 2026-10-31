@@ -28,6 +28,8 @@ def luhn(value: str) -> bool:
 DETECTORS = [
     ("injection", "Instruction override", r"(?i)\b(ignore|disregard|forget)\b[^.\n]{0,50}\b(previous|prior|above|earlier|system)\b[^.\n]{0,30}\b(instructions?|rules?|prompts?)\b", 85, "v1"),
     ("injection", "Secret or prompt exfiltration", r"(?i)\b(reveal|show|print|leak|dump|exfiltrate)\b[^.\n]{0,35}\b(system prompt|confidential|salary|hidden instructions?|secrets?|credentials?|passwords?|api keys?)\b", 85, "v1"),
+    ("injection", "Instruction override (broad)", r"(?i)\b(ignore|disregard|forget|bypass|override)\b[^.\n]{0,40}\b(all|any|every|the|your|these|those)\b[^.\n]{0,30}\b(instructions?|rules?|guidelines|guardrails|restrictions)\b|\b(pretend|imagine)\b[^.\n]{0,20}\b(no|without)\b[^.\n]{0,10}\b(rules|restrictions|guidelines|filters?)\b", 82, "v3"),
+    ("injection", "System prompt extraction", r"(?i)\b(output|repeat|print|reveal|show|tell me|give me)\b[^.\n]{0,30}\b(your|the)\b[^.\n]{0,15}\b(system (prompt|message)|initial instructions|admin password)\b", 85, "v3"),
     ("injection", "Role hijack or jailbreak", r"(?i)\b(you are now|act as (an? )?(unrestricted|dan)|developer mode|jailbreak|do anything now)\b", 75, "v1"),
     ("injection", "Hidden instruction tags", r"(?i)<\s*(system|instructions?|assistant)\s*>", 80, "v1"),
     ("injection", "Markdown image exfiltration", r"!\[[^\]]*\]\(https?://[^)\s]+\?[^)\s]*\)", 85, "v1"),
@@ -127,6 +129,17 @@ def redact(text: str, categories: set[str] | None = None) -> str:
     """Redact detected values from text. Injection is intentionally not rewritten here."""
     categories = categories or {"secrets", "pii", "business"}
     output = text
+    # Replace Base64 blobs whose decoded text contains a redactable value; otherwise the
+    # encoded secret would pass through untouched even though the gate reports Redact.
+    def _encoded(match: re.Match[str]) -> str:
+        try:
+            decoded = base64.b64decode(match.group(), validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return match.group()
+        if decoded.isprintable() and any(f["cat"] in categories for f in _run(decoded)):
+            return "[REDACTED:encoded]"
+        return match.group()
+    output = re.sub(r"[A-Za-z0-9+/]{24,}={0,2}", _encoded, output)
     for cat, label, pattern, _score, _version in DETECTORS:
         if cat not in categories:
             continue
@@ -134,14 +147,19 @@ def redact(text: str, categories: set[str] | None = None) -> str:
     return output
 
 
-def gate(text: str) -> tuple[str, str, list[dict[str, Any]]]:
-    """Return (action, safe_text, findings); Block outranks Redact, which outranks Allow."""
+def gate(text: str, cleared: set[str] | None = None) -> tuple[str, str, list[dict[str, Any]]]:
+    """Return (action, safe_text, findings); Block outranks Redact, which outranks Allow.
+
+    ``cleared`` lists redaction categories the caller is authorised to receive (for example
+    "business" for HR reading salary data released by the data layer). Injection is never cleared.
+    """
     findings = scan(text)
     categories = {item["cat"] for item in findings}
     if categories & BLOCK_CATEGORIES:
         return "Block", "", findings
-    if categories & {"secrets", "pii", "business"}:
-        return "Redact", redact(text, categories), findings
+    to_redact = categories & {"secrets", "pii", "business"} - (cleared or set())
+    if to_redact:
+        return "Redact", redact(text, to_redact), findings
     return "Allow", text, findings
 
 

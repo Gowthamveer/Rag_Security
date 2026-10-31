@@ -1,6 +1,6 @@
 """RAG Security Gateway API. Review configuration before production deployment."""
 from __future__ import annotations
-import hashlib, io, json, os, secrets, time, uuid
+import hashlib, io, json, os, re, secrets, time, uuid
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +19,7 @@ from sqlalchemy import (Boolean, Column, Integer, MetaData, String, Table, Text,
                         create_engine, select, insert, update, func)
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
+import data_layer
 from detectors import gate, redact, scan
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./rsg.db")
@@ -37,6 +38,10 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "2000000"))
 GATEWAY_RATE_LIMIT = int(os.getenv("GATEWAY_RATE_LIMIT", "60"))
 GATEWAY_RATE_WINDOW_SECONDS = int(os.getenv("GATEWAY_RATE_WINDOW_SECONDS", "60"))
+# After the first admin exists, only admins can create accounts unless this is enabled.
+ALLOW_PUBLIC_SIGNUP = os.getenv("ALLOW_PUBLIC_SIGNUP", "true").lower() in {"1", "true", "yes"}
+# Roles that may read every stored document; other roles only see documents they uploaded.
+CORPUS_ROLES = {"admin", "analyst"}
 LLM_BASE = os.getenv("UPSTREAM_URL", "https://api.groq.com/openai/v1").rstrip("/")
 LLM_MODEL = os.getenv("MODEL", "llama-3.3-70b-versatile")
 LLM_KEY = os.getenv("GROQ_API_KEY") or os.getenv("UPSTREAM_API_KEY") or os.getenv("API_KEY") or ""
@@ -130,6 +135,8 @@ def migrate_legacy_schema() -> None:
                         conn.exec_driver_sql(f'ALTER TABLE "{table_name}" ALTER COLUMN "{column_name}" TYPE TEXT USING "{column_name}"::text')
 
 migrate_legacy_schema()
+data_layer.init(DB)
+employee_repo = data_layer.EmployeeRepository(DB)
 
 # Per-process throttling; use a shared store (e.g. Redis) behind multiple workers in production.
 _attempts: dict[str, deque[float]] = defaultdict(deque)
@@ -357,25 +364,70 @@ def content_text(content: Any) -> str:
     return ""
 
 
-def safe_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Gate client-supplied content regardless of role; callers cannot assert trusted provenance."""
-    result, findings = [], []
-    for message in messages:
+REMOVED_NOTICE = "[Removed by gateway: this passage contained instructions and was excluded as unsafe.]"
+_CHUNK_SPLIT = re.compile(r"\n[ \t]*-{3,}[ \t]*\n|\n[ \t]*\n")
+
+
+def _filter_passages(text: str, holds_question: bool) -> tuple[str, list[dict[str, Any]], int]:
+    """Gate text passage by passage so one poisoned retrieved chunk does not sink the request.
+
+    The final passage of the final user message is treated as the end user's question: if it is
+    an injection attempt, the whole request is blocked. Any other passage that trips the injection
+    gate is replaced with a notice; secrets/PII/business values are redacted in place.
+    """
+    passages = [p for p in _CHUNK_SPLIT.split(text)] or [text]
+    kept, findings, dropped = [], [], 0
+    for index, passage in enumerate(passages):
+        action, safe, found = gate(passage)
+        findings.extend(found)
+        if action == "Block":
+            if holds_question and index == len(passages) - 1:
+                raise HTTPException(400, "Request blocked by security policy")
+            kept.append(REMOVED_NOTICE)
+            dropped += 1
+        else:
+            kept.append(safe)
+    return "\n\n".join(kept), findings, dropped
+
+
+def safe_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Gate client-supplied content; returns (messages, findings, passages_removed).
+
+    System/developer messages come from the authenticated calling application, so injection
+    phrasing there (e.g. "never reveal the system prompt") is recorded but not blocked; secrets
+    and personal data in them are still redacted. All other content is gated per passage.
+    """
+    result, findings, removed = [], [], 0
+    last_user = max((i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "user"), default=-1)
+    for position, message in enumerate(messages):
         if not isinstance(message, dict):
             raise HTTPException(422, "Each message must be an object")
         role = message.get("role")
         if role not in {"system", "developer", "user", "assistant", "tool"}:
             raise HTTPException(422, "Unsupported message role")
+
+        def clean(text: str, holds_question: bool) -> str:
+            nonlocal removed
+            if role in {"system", "developer"}:
+                found = gate(text)[2]
+                findings.extend({"role": role, **item} for item in found)
+                cats = {f["cat"] for f in found} & {"secrets", "pii", "business"}
+                return redact(text, cats) if cats else text
+            safe, found, dropped = _filter_passages(text, holds_question)
+            findings.extend({"role": role, **item} for item in found)
+            removed += dropped
+            return safe
+
         content = message.get("content", "")
-        text_content = content_text(content)
-        action, safe, found = gate(text_content)
-        findings.extend([{"role": role, **item} for item in found])
-        if action == "Block":
-            raise HTTPException(400, "Request blocked by security policy")
         if isinstance(content, str):
-            content = safe
+            content = clean(content, position == last_user)
         elif isinstance(content, list):
-            content = [{**part, "text": safe} if isinstance(part, dict) and part.get("type") in {"text", "input_text"} else part for part in content]
+            text_parts = [i for i, part in enumerate(content) if isinstance(part, dict) and part.get("type") in {"text", "input_text"}]
+            content = [
+                {**part, "text": clean(str(part.get("text", "")), position == last_user and i == text_parts[-1])}
+                if i in text_parts else part
+                for i, part in enumerate(content)
+            ]
         result.append({**message, "content": content})
     # Insert a server-controlled policy after any client-supplied system/developer messages.
     # This supplements (but cannot replace) strict model/provider-side controls.
@@ -384,7 +436,7 @@ def safe_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]],
     while insert_at < len(result) and result[insert_at].get("role") in {"system", "developer"}:
         insert_at += 1
     result.insert(insert_at, policy)
-    return result, findings
+    return result, findings, removed
 
 
 @app.get("/health")
@@ -400,13 +452,15 @@ def health() -> dict[str, Any]:
 def auth_status() -> dict[str, bool]:
     with DB.connect() as conn:
         admin_exists = conn.execute(select(func.count()).select_from(users)).scalar_one() > 0
-    return {"admin_exists": admin_exists}
+    return {"admin_exists": admin_exists, "public_signup": ALLOW_PUBLIC_SIGNUP or not admin_exists}
 
 @app.post("/auth/register")
 def register(c: Cred, request: Request) -> dict[str, Any]:
     rate_limit(request, "register")
     with DB.begin() as conn:
         count = conn.execute(select(func.count()).select_from(users)).scalar_one()
+        if count and not ALLOW_PUBLIC_SIGNUP:
+            raise HTTPException(403, "Public sign-up is disabled. Ask an administrator for an account.")
         role = "admin" if not count else "viewer"
         try:
             conn.execute(insert(users).values(email=c.email, pw=argon2.hash(c.password), role=role,
@@ -466,7 +520,7 @@ class TotpVerify(BaseModel):
 class AdminUserCreate(BaseModel):
     email: str = Field(min_length=5, max_length=320)
     password: str = Field(min_length=8, max_length=256)
-    role: str = Field(default="viewer", pattern="^(analyst|viewer)$")
+    role: str = Field(default="viewer", pattern="^(analyst|viewer|hr|service)$")
     @field_validator("email")
     @classmethod
     def valid_email(cls, value: str) -> str:
@@ -535,20 +589,20 @@ async def scan_file(f: UploadFile = File(...), u: dict[str, str] = Depends(curre
 
 @app.get("/documents")
 def list_documents(u: dict[str, str] = Depends(current_user)) -> dict[str, Any]:
-    require(u, "admin", "analyst", "viewer")
+    require(u, "admin", "analyst", "viewer", "hr")
     with DB.connect() as conn:
         query = select(docs.c.id, docs.c.name, docs.c.owner, docs.c.risk, docs.c.findings, docs.c.sha256, docs.c.created_at)
-        if u["role"] == "viewer":
+        if u["role"] not in CORPUS_ROLES:
             query = query.where(docs.c.owner == u["sub"])
         rows = conn.execute(query.order_by(docs.c.id.desc()).limit(500)).mappings().all()
     return {"documents": [{**dict(row), "findings": _json_load(row["findings"])} for row in rows]}
 
 @app.get("/documents/{document_id}")
 def get_document(document_id: int, u: dict[str, str] = Depends(current_user)) -> dict[str, Any]:
-    require(u, "admin", "analyst", "viewer")
+    require(u, "admin", "analyst", "viewer", "hr")
     with DB.connect() as conn:
         row = conn.execute(select(docs).where(docs.c.id == document_id)).mappings().first()
-    if not row or (u["role"] == "viewer" and row["owner"] != u["sub"]):
+    if not row or (u["role"] not in CORPUS_ROLES and row["owner"] != u["sub"]):
         raise HTTPException(404, "Document not found")
     return {**dict(row), "findings": _json_load(row["findings"])}
 
@@ -586,6 +640,10 @@ def ask(
     u: dict[str, str] = Depends(current_user),
 ) -> dict[str, Any]:
     rate_limit_gateway(u["sub"])
+
+    # Test-response injection is a debugging aid; it must not be available to public viewer accounts.
+    if a.response_override is not None and u["role"] not in {"admin", "analyst"}:
+        raise HTTPException(403, "Test responses require the analyst or admin role")
 
     # 1. Scan and filter the incoming question
     action, question, findings = gate(a.question)
@@ -633,17 +691,21 @@ def ask(
             for word in words
         ]
 
+        query = (
+            select(
+                docs.c.name,
+                docs.c.body,
+                docs.c.risk,
+            )
+            .where(docs.c.risk < 70)
+            .where(__import__("sqlalchemy").or_(*clauses))
+        )
+        # Apply the same document scoping as GET /documents: viewers may only
+        # retrieve documents they own, so public sign-ups cannot read the corpus.
+        if u["role"] not in CORPUS_ROLES:
+            query = query.where(docs.c.owner == u["sub"])
         with DB.connect() as conn:
-            rows = conn.execute(
-                select(
-                    docs.c.name,
-                    docs.c.body,
-                    docs.c.risk,
-                )
-                .where(docs.c.risk < 70)
-                .where(__import__("sqlalchemy").or_(*clauses))
-                .limit(3)
-            ).all()
+            rows = conn.execute(query.limit(3)).all()
 
     # 5. Filter retrieved documents before using them as context
     contexts = []
@@ -656,6 +718,29 @@ def ask(
                 f"[UNTRUSTED DOCUMENT: {name}]\n"
                 f"{safe_body[:5000]}"
             )
+
+    # 5b. Structured company data goes through the secure data layer, which only selects
+    # the columns and rows this user's role is cleared for.
+    data_access = None
+    # Salary-type values are only let through the output gate when the data layer itself
+    # released them to a cleared role for this question; otherwise normal redaction applies.
+    cleared: set[str] = set()
+    if data_layer.wants_employee_data(question):
+        result = employee_repo.search(u, question)
+        if result["rows"] and "annual_salary" in result["fields"]:
+            cleared = data_layer.CLEARED_CATEGORIES.get(u["role"], set())
+        data_text = data_layer.as_context(result)
+        data_action, safe_data, _ = gate(data_text, cleared)
+        if data_action != "Block":
+            contexts.insert(0, safe_data)
+        data_access = {
+            "source": "employees",
+            "role": result["role"],
+            "fields_released": result["fields"],
+            "fields_denied": result["denied_fields"],
+            "rows": len(result["rows"]),
+        }
+        _audit(u["sub"], "data_layer_read", {**data_access, "release_hash": data_layer.fingerprint(result)})
 
     context = "\n\n---\n\n".join(contexts)
 
@@ -695,7 +780,7 @@ def ask(
         )
 
     # 8. Always filter the generated answer before returning it
-    out_action, safe_answer, out_findings = gate(answer)
+    out_action, safe_answer, out_findings = gate(answer, cleared)
     # 9. Combine input and output decisions for the final response
     if out_action == "Block":
         final_action = "Block"
@@ -727,6 +812,7 @@ def ask(
             "input_action": action,
             "output_action": out_action,
             "retrieved_documents": len(contexts),
+            "data_access": data_access,
         },
     )
 
@@ -735,24 +821,49 @@ def ask(
         "decision": final_action,
         "answer": final_answer,
         "trace_id": trace_id,
+        "data_access": data_access,
     }
+
+_END_USER_RE = re.compile(r"^[A-Za-z0-9._@+-]{1,320}$")
+
+
+def resolve_end_user(request: Request, u: dict[str, str]) -> str | None:
+    """Return the employee a service account is calling on behalf of (X-End-User header).
+
+    Only accounts with the "service" role may assert an end user, so a normal user cannot
+    impersonate someone else. The value labels traces and per-person rate limits; it does not
+    grant any extra access.
+    """
+    value = request.headers.get("x-end-user")
+    if value is None:
+        return None
+    if u.get("role") != "service":
+        raise HTTPException(403, "Only service accounts may send X-End-User")
+    value = value.strip().lower()
+    if not _END_USER_RE.match(value):
+        raise HTTPException(422, "X-End-User must be an email or user ID (letters, digits, . _ @ + -)")
+    return value
+
 
 @app.post("/v1/chat/completions")
 def chat(r: ChatReq, request: Request, u: dict[str, str] = Depends(current_user)) -> dict[str, Any]:
-    rate_limit_gateway(u["sub"])
-    messages, query_findings = safe_messages(r.messages)
+    end_user = resolve_end_user(request, u)
+    actor = f"{u['sub']} for {end_user}" if end_user else u["sub"]
+    rate_limit_gateway(actor)
+    messages, query_findings, removed = safe_messages(r.messages)
     # Keep model selection controlled by server config; do not allow callers to select arbitrary models.
     response = llm(messages, max_tokens=r.max_tokens or 1200, temperature=r.temperature)
     message = response["choices"][0].get("message", {})
     output = content_text(message.get("content", ""))
     output_action, safe_output, output_findings = gate(output)
     message["content"] = safe_output or "Response blocked by the gateway."
-    trace_id = new_trace(u["sub"], content_text(r.messages[-1].get("content", "")), output_action,
-                         {"query": query_findings, "output": output_findings})
+    trace_id = new_trace(actor, content_text(r.messages[-1].get("content", "")), output_action,
+                         {"query": query_findings, "output": output_findings,
+                          "passages_removed": removed, "end_user": end_user})
     response["gateway"] = {"trace_id": trace_id, "query_action": "Redact" if any(x.get("cat") in {"pii", "secrets", "business"} for x in query_findings) else "Allow",
-                            "output_action": output_action}
+                            "output_action": output_action, "passages_removed": removed, "end_user": end_user}
     if output_action == "Block":
-        alert(f"Output blocked for {u['sub']} ({trace_id})")
+        alert(f"Output blocked for {actor} ({trace_id})")
     return response
 
 
